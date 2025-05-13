@@ -1,163 +1,185 @@
+<#
+.SYNOPSIS
+Fetches and analyzes recent Azure DevOps build data for specified projects.
+
+.NOTES
+- Ensure token or PAT is securely provided via parameters or environment variables.
+- Avoid hardcoding sensitive credentials.
+#>
 
 param (
-    [string]$Account = '',
-    [string]$PAT = '',
-    [int]$MonthsToLookBack = 3,
-    [string]$ProjectsToScan = '',
-    [string]$BranchPatterns = 'refs/heads/(release|main)', # respects master, main, product, release, dev
-    [int]$MaxNumberOfRecentBuildsToLookBack = 10000,
+    [string]$Account = 'YourOrganizationName',
+    [string]$Token = '',
+    [int]$DaysToLookback = 10,
+    [string]$ProjectsToScan = 'ProjectA,ProjectB', # Comma-separated list
+    [string]$BranchPatterns = 'refs/heads/(release|product|master|main|develop|osmain)',
+    [int]$MaxNumberOfRecentBuildsToLookBack = 5000,
     [string]$OutputDirectory = "${PSScriptRoot}\BuildLogs"
 )
 
-$token = [System.Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes(":$($PAT)"))
-$date = $((Get-Date).ToString('yyyy-MM-dd-HH-mm-ss'))
-$dateToLookBack = $todaysDate.AddMonths($monthsToLookBack*-1)
+Write-Host "Account: $Account"
+Write-Host "BranchPatterns: $BranchPatterns"
+Write-Host "ProjectsToScan: $ProjectsToScan"
+Write-Host "MaxNumberOfRecentBuildsToLookBack: $MaxNumberOfRecentBuildsToLookBack"
+Write-Host "OutputDirectory: $OutputDirectory"
+Write-Host "DaysToLookback: $DaysToLookback"
 
+$PAT = ""  # Securely retrieve this from environment or key vault if needed
 
-# Create a web session
 $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
-$session.Headers["Authorization"] = "Basic $token"
+
+if ($Token) {
+    $session.Headers["Authorization"] = "Bearer $Token"
+} elseif ($PAT) {
+    $base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$PAT"))
+    $session.Headers["Authorization"] = "Basic $base64AuthInfo"
+}
+
 $session.Headers["Content-Type"] = "application/json"
 
-# API URL to fetch all projects
-if($ProjectsToScan -eq '*') {
+$date = (Get-Date).ToString('yyyy-MM-dd-HH-mm-ss')
+$dateToLookBack = (Get-Date).AddDays(-1 * $DaysToLookback)
+
+if ($ProjectsToScan -eq '*') {
     $url = "https://dev.azure.com/$Account/_apis/projects?api-version=7.1-preview.4"
-    $response = Invoke-RestMethod -Uri $url -Method Get -WebSession $session
-    
+    $response = Invoke-ADORequest -Uri $url -Method Get -WebSession $session
     $Projects = $response.value | ForEach-Object { $_.name }
 } else {
     $Projects = $ProjectsToScan -split ',' | ForEach-Object { $_.Trim() }
 }
 
-foreach ($project in $Projects) 
-{
+$results = @()
 
-    $url = "https://dev.azure.com/$Account/$project/_apis/pipelines?api-version=6.0-preview.1"
-    $pipelines = Invoke-RestMethod -Uri $url -Method Get -WebSession $session
-    
-    foreach ($pipeline in $pipelines.value) 
-    {
-        $results = @()
+foreach ($project in $Projects) {
+    Write-Host "Fetching builds for project: $project"
+    $minTime = $dateToLookBack.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    Write-Host "Using minTime: $minTime"
 
-        $pipeineId = $pipeline.id
-        # API URL to fetch the pipeline definition
-        $pipelineUrl = "https://dev.azure.com/$Account/$Project/_apis/build/definitions/${pipeineId}?api-version=6.0"
+    $buildsUrl = "https://dev.azure.com/$Account/$project/_apis/build/builds?`$top=${MaxNumberOfRecentBuildsToLookBack}&statusFilter=completed&minTime=$minTime&api-version=6.0"
+    $buildsResponse = Invoke-ADORequest -Uri $buildsUrl -Method Get -WebSession $session -ErrorAction Stop
+    $recentBuilds = $buildsResponse.value | Sort-Object -Property startTime -Descending | Select-Object -First $MaxNumberOfRecentBuildsToLookBack
 
-        # Fetch the current pipeline definition
-        $pipelineDetails  = Invoke-RestMethod -Uri $pipelineUrl -Method Get -WebSession $session -ErrorAction Stop
+    Write-Host "Fetched $($recentBuilds.Count) recent builds for $project"
 
-        if ($null -eq $pipelineDetails ) {
-            Write-Host "Failed to fetch pipeline definition! $($pipeline.name)"
-            continue
-        }
+    foreach ($build in $recentBuilds) {
+        if ($build.status -ne 'completed') { continue }
+        $buildDate = $build.startTime
+        if (-not $buildDate -or $buildDate -lt $dateToLookBack) { continue }
+        $branchName = $build.sourceBranch
+        if (-not ($branchName -match $BranchPatterns)) { continue }
 
-        # Check if the pipeline is enabled
-        if ($pipelineDetails.queueStatus -eq "disabled") {
-            continue
-        }
+        $buildResult = $build.result
+        $pipelineId = $build.definition.id
+        $pipelineName = $build.definition.name
+        $buildId = $build.id
+        $buildReason = $build.reason
+        $repository = $build.repository.name
+        $buildUrl = $build._links.web.href
+        $buildActualUrl = $buildUrl.Replace("https://dev.azure.com/$Account/$project/_apis/build/builds/", "https://dev.azure.com/$Account/$project/_build/results?buildId=")
 
-        Write-Host "====================  $($pipeline.name)  ============================="
+        Write-Host "Processing build $buildId from $branchName on $buildDate ($buildResult)"
 
-        $getBuildUrl = "https://dev.azure.com/$Account/$project/_apis/build/builds?definitions=$($pipelineDetails.id)&api-version=6.0"
-        $builds = Invoke-RestMethod -Uri $getBuildUrl -Method Get -ContentType "application/json" -WebSession $session
-        $recentBuilds = $builds.value | Sort-Object -Property startTime -Descending | Select-Object -First $maxNumberOfRecentBuildsToLookBack
+        try {
+            if ($buildResult -eq 'succeeded') {
+                $result = [PSCustomObject]@{
+                    Organization    = $Account
+                    Project         = $project
+                    Repository      = $repository
+                    Branch          = $branchName
+                    BuildId         = $buildId
+                    PipelineId      = $pipelineId
+                    Build           = $buildResult
+                    BuildDefinition = $pipelineName
+                    BuildURL        = $buildActualUrl
+                    BuildDate       = $buildDate
+                    BuildReason     = $buildReason
+                    JobName         = ""
+                    JobStartTime    = ""
+                    JobLogsURL      = ""
+                    JobResult       = ""
+                    JobMessage      = ""
+                }
+            } else {
+                # Timeline logic...
+                $timelineUrl = "https://dev.azure.com/$Account/$project/_apis/build/builds/$buildId/timeline?api-version=7.1"
+                $timeline = Invoke-ADORequest -Uri $timelineUrl -Method Get -WebSession $session -ErrorAction Stop
 
-        foreach ($build in $recentBuilds) 
-        {
-            $buildId = $build.id
-            $branchName = $build.sourceBranch
-            $buildDate = $build.startTime
-            $buildReason = $build.reason
-            $buildResult = $build.result
-
-            if ($build.status -ne 'completed' ) { 
-                continue 
-            } # Skip if the build is not completed or not succeeded.
-
-            if($null -eq $buildDate -and $buildDate -lt $dateToLookBack) {
-                continue 
-            }
-
-            try {
-                $Repository = $build.repository.name
-                $Branch = $branchName
-                $BuildDefinition = $pipeline.name
-                $BuildURL = $build._links.web.href
-                $BuildActualUrl = $BuildUrl.Replace("https://dev.azure.com/$Account/$Project/_apis/build/builds/", "https://dev.azure.com/$Account/$Project/_build/results?buildId=")
-
-                try {
-                    if ($buildResult -eq 'succeeded') {
-                        $result = [PSCustomObject]@{
-                            Organization = $Account
-                            Project = $Project
-                            Repository = $Repository                            
-                            Branch = $Branch
-                            BuildId = $buildId
-                            PipelineId = $pipeineId
-                            Build = $buildresult
-                            BuildDefinition = $BuildDefinition
-                            BuildURL = $BuildActualUrl
-                            BuildDate = $buildDate
-                            BuildReason = $buildReason
-                            JobName = ""
-                            JobStartTime = ""
-                            JobLogsURL = ""
-                            JobResult = ""
+                function Get-AncestorStage {
+                    param ([object]$record, [array]$allRecords)
+                    $current = $record
+                    while ($current -and $current.parentId) {
+                        $parent = $allRecords | Where-Object { $_.id -eq $current.parentId }
+                        if ($parent -and $parent.type -eq 'Stage') {
+                            return $parent
                         }
+                        $current = $parent
                     }
-                    else 
-                    {
-                        $BuildRun = "https://dev.azure.com/$Account/$project/_apis/build/builds/$buildId/timeline?api-version=7.1"
-                        $BuildRundetails = Invoke-RestMethod -Uri $BuildRun -Method Get -WebSession $session
-                        $r = $BuildRundetails.records | Where-Object { $null -ne $_.result -and $_.result -eq 'failed' -and $_.type -eq 'Job' } | Select-Object -First 1
+                    return $null
+                }
 
-                        $JobName = $r.name
-                        $JobStartTime = ""
-                        $JobLogsURL = ""
-                        $jobResult = ""
+                $failedTasks = $timeline.records | Where-Object { $_.type -eq 'Task' -and $_.result -eq 'failed' }
+                $failedJobs = $timeline.records | Where-Object { $_.type -eq 'Job' -and $_.result -eq 'failed' }
 
-                        if(-not($null -eq $r.startTime -or $r.startTime -eq '')) {
-                            $JobStartTime = $r.startTime
-                        }
+                $message = ""
+                $firstFailedJobWithMessage = $null
 
-                        if(-not($null -eq $r.log -or $null -eq $r.log.url -or $r.log.url -eq '')) {
-                            $JobLogsURL = $r.log.url
-                            $jobResult = $r.result
-                        }
+                foreach ($task in $failedTasks) {
+                    $job = $failedJobs | Where-Object { $_.id -eq $task.parentId }
+                    if (-not $job) { continue }
 
-                        $result = [PSCustomObject]@{
-                            Organization = $Account
-                            Project = $Project
-                            Repository = $Repository
-                            Branch= $Branch
-                            BuildId = $buildId
-                            PipelineId = $pipeineId
-                            Build = $buildresult
-                            BuildDefinition = $BuildDefinition
-                            BuildURL = $BuildActualUrl
-                            BuildDate = $buildDate
-                            BuildReason = $buildReason
-                            JobName = $JobName
-                            JobStartTime = $JobStartTime
-                            JobLogsURL = $JobLogsURL
-                            JobResult = $jobResult
+                    $stage = Get-AncestorStage -record $job -allRecords $timeline.records
+                    if (-not $stage -or $stage.result -ne 'failed') { continue }
+
+                    if ($task.issues) {
+                        $message = "Failed Task: $($task.name)`n"
+                        $task.issues | Select-Object -First 10 | ForEach-Object {
+                            $message += " - [$($_.type)] $($_.message)`n"
                         }
                     }
 
-                    $results += $result
+                    $firstFailedJobWithMessage = $job
+                    break
                 }
-                catch {
-                    Write-Host "New errors reported 1: $($_.Exception.Message) $($_.ScriptStackTrace)"
+
+                $JobName = $firstFailedJobWithMessage.name
+                $JobStartTime = $firstFailedJobWithMessage.startTime
+                $JobLogsURL = $firstFailedJobWithMessage.log?.url
+                $JobResult = $firstFailedJobWithMessage.result
+
+                $result = [PSCustomObject]@{
+                    Organization    = $Account
+                    Project         = $project
+                    Repository      = $repository
+                    Branch          = $branchName
+                    BuildId         = $buildId
+                    PipelineId      = $pipelineId
+                    Build           = $buildResult
+                    BuildDefinition = $pipelineName
+                    BuildURL        = $buildActualUrl
+                    BuildDate       = $buildDate
+                    BuildReason     = $buildReason
+                    JobName         = $JobName
+                    JobStartTime    = $JobStartTime
+                    JobLogsURL      = $JobLogsURL
+                    JobResult       = $JobResult
+                    JobMessage      = $message
                 }
             }
-            catch {
-                Write-Host "New errors reported 2: $($_.Exception.Message) $($_.ScriptStackTrace)"
-            }
+
+            $results += $result
+            Write-Host "$buildDate | $buildResult | $pipelineName | $branchName | $JobName"
+        } catch {
+            Write-Host "Error processing build $buildId: $($_.Exception.Message)"
         }
-        if($results.Count -ne 0) {
-            Write-Host "Total builds found for $($pipeline.name) : $($results.Count)"
-            $results | Export-Excel "${PSScriptRoot}\BuildLogs\$azureBuildJob_results_$($date).xlsx" -WorksheetName "BuildJob_Results" -TableName "BuildJob" -Append
-            $results | ConvertTo-CSV -Delimiter "," -NoTypeInformation | Select-Object -Last 1 | Out-File "${PSScriptRoot}\BuildLogs\azureBuildJob_results_$($date).csv" -Append
-        }
+    }
+
+    $ActualProjectsToScan = if ($ProjectsToScan -eq '*') { 'all' } else { $ProjectsToScan.Replace(",", "_") }
+
+    if ($results.Count -ne 0) {
+        Write-Host "Total builds found for project $project: $($results.Count)"
+        $results | Export-Excel "$OutputDirectory\ADOReport_${ActualProjectsToScan}_$date.xlsx" -WorksheetName "BuildJob_Results" -TableName "BuildJob" -Append
+        $results | ConvertTo-Csv -Delimiter "," -NoTypeInformation | Select-Object -Last 1 | Out-File "$OutputDirectory\ADOReport_${ActualProjectsToScan}_$date.csv" -Append
+    } else {
+        Write-Host "No builds found for project $project."
     }
 }
